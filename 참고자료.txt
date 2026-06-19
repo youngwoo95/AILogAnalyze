@@ -1,0 +1,5 @@
+# 가상환경 설치
+python -m venv .venv
+
+# 가상환경 실행
+.\.venv\Scripts\Activate.ps1

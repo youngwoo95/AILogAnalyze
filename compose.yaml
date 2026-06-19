@@ -1,0 +1,32 @@
+services:
+  nginx-security-analyzer:
+    build:
+      context: .
+    container_name: nginx-security-analyzer
+    init: true
+    restart: unless-stopped
+    ports:
+      - "${API_PORT:-8000}:8000"
+    environment:
+      LOG_PATH: "/var/log/nginx/${NGINX_ACCESS_LOG:-access.log}"
+      DEFAULT_WINDOW_HOURS: "${DEFAULT_WINDOW_HOURS:-3}"
+      DEFAULT_MAX_LINES: "${DEFAULT_MAX_LINES:-5000}"
+    volumes:
+      - "${NGINX_LOG_DIR:-/var/log/nginx}:/var/log/nginx:ro"
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
