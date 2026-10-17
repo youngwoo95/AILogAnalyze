@@ -1,15 +1,51 @@
 # Nginx Security Analyzer (hackingdetect)
 
-Nginx 접근 로그(access.log)를 분석해 공격 시도를 **룰 기반으로 탐지**하는 FastAPI 서비스입니다.
-n8n 워크플로와 연동해 분석 결과를 Gemini로 요약하고 Slack으로 알림을 보냅니다.
+Nginx 접근 로그(access.log)를 주기적으로 분석해 공격 시도를 **룰 기반으로 탐지**하고, 결과를 로컬 LLM(Ollama + Gemma 4)으로 요약해 Slack으로 알려주는 보안 모니터링 서비스입니다.
 
-> 탐지는 정규식 룰이 담당하고, LLM은 탐지 결과를 **요약만** 합니다.
+> 탐지와 위험도 판정은 정규식 룰이 담당하고, LLM은 탐지 결과를 **요약만** 합니다.
+
+## 개발 배경
+
+AI와 자동화 도구가 보편화되면서 공격 시도를 만드는 비용이 크게 낮아졌고, 대상을 가리지 않고 인터넷에 노출된 서버를 훑는 무차별 스캔·공격이 늘고 있습니다. `.env` 같은 설정 파일이나 관리자 페이지를 찾는 요청은 서비스 규모와 상관없이 들어오지만, 운영자가 access.log를 매번 직접 열어 확인하기는 현실적으로 어렵습니다.
+
+이 프로젝트는 그 공백을 메우기 위해 만들었습니다. 접근 로그에서 공격 시도를 자동으로 찾아내고, 운영자가 Slack에서 바로 읽고 판단할 수 있는 한국어 요약으로 전달합니다.
+
+## 운영 사례
+
+실제 운영 중인 서비스에 적용해, 단일 IP의 자동화 스캔 공격을 탐지하고 차단했습니다.
+
+- **탐지**: 3시간 분석 구간에서 의심 요청 221건, 위험도 HIGH
+- **집중도**: 분석한 로그 272줄 중 221줄(약 81%)이 한 IP에서 발생
+- **주요 유형**: 환경 파일 접근 시도 206건, 동적 스크립트 스캔 15건, 관리자 페이지 스캔 4건
+- **조치**: Slack 알림을 받고 해당 IP 차단
+
+실제로 받은 알림 (IP 일부 마스킹):
+
+```
+[보안 로그 요약]
+위험도: HIGH
+분석 기간: 최근 3시간
+탐지 건수: 221건 (분석 272줄)
+
+[주요 탐지]
+- 환경 파일 접근 시도: 206
+- 동적 스크립트 스캔: 15
+- 관리자 페이지 스캔: 4
+
+[주요 의심 IP]
+- 34.50.x.x (221): 환경 파일 접근 시도, 동적 스크립트 스캔, 관리자 페이지 스캔
+
+[권장 조치]
+- 해당 IP(34.50.x.x)에 대한 방화벽 차단 및 접근 제한 정책 적용을 권장합니다.
+```
+
+> 한 요청이 여러 유형에 동시에 걸릴 수 있어(예: `/admin/config.php`는 관리자 페이지·환경 파일·동적 스크립트에 모두 해당), 유형별 건수의 합은 전체 탐지 건수보다 클 수 있습니다.
 
 ## 구성
 
 ```
 [Nginx access.log]
-        │ 파일 읽기
+        │ 파일 읽기 (읽기 전용 마운트)
         ▼
 [분석 API (FastAPI)]  GET /security/analyze
         ▲
@@ -17,10 +53,18 @@ n8n 워크플로와 연동해 분석 결과를 Gemini로 요약하고 Slack으�
 [n8n 워크플로]
    1. Schedule Trigger (3시간)
    2. HTTP Request  → 분석 API 호출
-   3. IF            → riskLevel ≠ NONE 일 때만 진행
-   4. Basic LLM Chain + Google Gemini Chat Model → 요약
-   5. HTTP Request  → Slack Incoming Webhook 전송
+   3. Basic LLM Chain + Ollama Chat Model (gemma4) → 요약
+   4. HTTP Request  → Slack Incoming Webhook 전송
 ```
+
+탐지가 없는 구간(`NONE`)도 "최근 분석 구간에서 의심 접근 없음" 한 줄로 발송해, 모니터링이 정상적으로 돌고 있는지 함께 확인합니다. 탐지됐을 때만 알림을 받으려면 [n8n 연동](#n8n-연동)의 선택 IF 노드를 추가하면 됩니다.
+
+## 설계 원칙
+
+- **탐지는 룰, 요약은 LLM**: 공격 판정과 위험도는 정규식 룰과 고정된 기준으로 계산합니다. 같은 로그는 항상 같은 결과를 내고, 탐지 결과가 LLM의 판단에 따라 달라지지 않습니다.
+- **로컬 LLM으로 요약**: 요약은 Ollama로 직접 실행하는 Gemma 4가 처리해, 탐지 결과가 외부 LLM API로 전송되지 않습니다. LLM이 하는 일은 집계된 JSON을 정해진 형식으로 요약하는 것뿐이라 로컬 모델로 충분합니다.
+- **로그 원문은 LLM에 넘기지 않음**: 로그는 외부 요청자가 URL이나 헤더로 내용을 마음대로 넣을 수 있는 데이터입니다. LLM에는 집계 결과(유형별 건수, IP별 건수)만 전달하고 원문(`samples`)은 제외하며, 프롬프트에도 데이터 안의 지시문을 따르지 않도록 명시해 프롬프트 인젝션 가능성을 줄였습니다.
+- **최소 권한**: 컨테이너는 Nginx 로그 디렉터리를 읽기 전용으로 마운트합니다.
 
 ## 주요 기능
 
@@ -171,7 +215,7 @@ curl "http://localhost:8000/security/analyze?hours=3&max_lines=5000"
 | `analyzedLineCount` | 실제로 분석한 줄 수 |
 | `attackSummary` | 공격 유형별 건수 |
 | `topIps` | 의심 요청 상위 10개 IP와 유형별 건수 |
-| `samples` | 의심 로그 원문 최대 20건 |
+| `samples` | 의심 로그 원문 최대 20건 (LLM에는 전달하지 않음) |
 
 ## n8n 연동
 
@@ -179,10 +223,10 @@ curl "http://localhost:8000/security/analyze?hours=3&max_lines=5000"
 | --- | --- | --- |
 | 1 | Schedule Trigger | 3시간 간격 (API의 `hours=3`과 맞춤) |
 | 2 | HTTP Request | `GET http://<API_HOST>:8000/security/analyze?hours=3` |
-| 3 | IF | `{{ $json.riskLevel }}` is not equal to `NONE` |
-| 4 | Basic LLM Chain | Source: Define below, 아래 프롬프트 사용 |
-| 4-1 | Google Gemini Chat Model | 크레덴셜에 Gemini API 키, 모델은 Flash 계열 |
-| 5 | HTTP Request | `POST` Slack Webhook URL, Body: JSON / Using Fields Below |
+| 3 | Basic LLM Chain | Source: Define below, 아래 프롬프트 사용 |
+| 3-1 | Ollama Chat Model | 크레덴셜 Base URL에 Ollama 주소(`http://<OLLAMA_HOST>:11434`), Model은 사용 중인 `gemma4` 태그 |
+| 4 | HTTP Request | `POST` Slack Webhook URL, Body: JSON / Using Fields Below |
+| 선택 | IF | 2와 3 사이에 추가. `{{ $json.riskLevel }}` is not equal to `NONE` → 탐지됐을 때만 알림 |
 
 - Basic LLM Chain의 결과는 `{{ $json.text }}`에 들어 있습니다.
 - `$('HTTP Request')`는 **분석 API를 호출하는 노드의 이름**과 정확히 같아야 합니다.
@@ -232,3 +276,7 @@ curl "http://localhost:8000/security/analyze?hours=3&max_lines=5000"
 
 </details>
 
+</details>
+<img width="603" height="1311" alt="KakaoTalk_Photo_2026-10-17-23-17-34 001" src="https://github.com/user-attachments/assets/e77573c9-0c97-4349-893f-443c98e610a0" />
+
+<img width="603" height="1311" alt="KakaoTalk_Photo_2026-10-17-23-17-35 002" src="https://github.com/user-attachments/assets/1eca7169-dc69-45b7-b63d-e0506a629e34" />
